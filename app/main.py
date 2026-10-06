@@ -1,4 +1,5 @@
-"""HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取。"""
+"""HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取、
+离线交付包与服务数据归档（同一数据库快照）。"""
 from __future__ import annotations
 
 import hashlib
@@ -48,6 +49,11 @@ PACKAGE_ELIGIBILITY_HOOK: Any = None
 # 的钩子。生产中为空操作；并发测试借此在同一只读快照事务内、矩形读取之前
 # 提交标注修改，验证比较全程使用同一读取快照（不看到提交后的新标注）。
 COVERAGE_DIFF_SNAPSHOT_HOOK: Any = None
+
+# 服务数据归档"同一读快照内的记录读取与全部引用文件校验完毕 -> 写 ZIP"
+# 之间的钩子。生产中为空操作；并发测试借此在归档期间提交标注/发布等写入，
+# 验证归档全程对应同一个一致时点（不看到提交后的新数据）且不阻塞并发写入。
+ARCHIVE_SNAPSHOT_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -162,6 +168,83 @@ def _cleanup_tempfile(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+# 原图归档相对路径的扩展名只由库内 media_type 映射，绝不取自上传文件名
+# （上传文件名可能携带路径片段或非 ASCII 字符）；media_type 仅两种合法值。
+_ARCHIVE_ORIGINAL_EXT = {"image/png": ".png", "image/jpeg": ".jpg"}
+
+
+def _archive_original_relpath(doc: Any) -> str:
+    """原图在归档 ZIP 内的相对路径：``originals/{doc_id}{ext}``。
+
+    doc_id 是服务端生成的 uuid hex，扩展名只由库内登记的 media_type 决定，
+    因此该相对路径不可能包含目录穿越片段或上传文件名。
+    """
+    ext = _ARCHIVE_ORIGINAL_EXT.get(doc["media_type"])
+    if ext is None:
+        _error(
+            500,
+            "archive_unsupported_media_type",
+            f"document '{doc['id']}' has an unsupported archived media type"
+            f" {doc['media_type']!r}",
+            doc_id=doc["id"],
+        )
+    return f"originals/{doc['id']}{ext}"
+
+
+def _read_and_verify_archive_file(
+    path: str,
+    expected_sha256: str,
+    *,
+    kind: str,
+    missing_code: str,
+    read_code: str,
+    corrupt_code: str,
+    doc_id: str,
+    version: int | None = None,
+) -> tuple[bytes, str]:
+    """读取归档引用文件（原图或发布成品）并复算 SHA-256。
+
+    归档遵循"全有或全无"：文件缺失、无法读取或实际摘要与快照记录不符时
+    抛出统一业务错误（调用方向上传播即整单拒绝），绝不返回部分数据。
+    返回 (文件字节, 实际摘要)。
+    """
+    ident = {"doc_id": doc_id}
+    if version is not None:
+        ident["version"] = version
+    if not os.path.exists(path):
+        _error(
+            500,
+            missing_code,
+            f"{kind} referenced by the snapshot for document '{doc_id}'"
+            + (f" version {version}" if version is not None else "")
+            + " is missing on disk",
+            **ident,
+        )
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as exc:
+        _error(
+            500,
+            read_code,
+            f"failed to read {kind} for document '{doc_id}'"
+            + (f" version {version}" if version is not None else "")
+            + f": {exc}",
+            **ident,
+        )
+    actual_sha = _sha256_bytes(data)
+    if actual_sha != expected_sha256:
+        _error(
+            500,
+            corrupt_code,
+            f"{kind} for document '{doc_id}'"
+            + (f" version {version}" if version is not None else "")
+            + " failed integrity check against the snapshot",
+            **ident,
+        )
+    return data, actual_sha
 
 
 def _error(status: int, code: str, message: str, **extra: Any) -> None:
@@ -1380,6 +1463,312 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tmp_path,
             media_type="application/zip",
             filename="publication-package.zip",
+        )
+
+    # ---------------- 服务数据归档（同一数据库快照，全有或全无 ZIP） ----------------
+
+    @app.post("/service-data-archives")
+    def create_service_data_archive(
+        background_tasks: BackgroundTasks,
+    ) -> FileResponse:
+        """生成一次服务数据归档（运维请求，无请求体）。
+
+        归档包含**同一个数据库快照**中的全部已提交数据：文档、各修订标注
+        （含发布记录与撤回记录），以及该快照引用到的**原图**与**发布成品**。
+        所有记录都在**同一个只读快照事务**（延迟 ``BEGIN`` 的 WAL 读快照）中
+        读取：归档进行期间并发提交的标注修改/发布/撤回对本次读取不可见，
+        归档因此**只对应一个一致时点**；事务纯只读、不持写锁，**并发写入可
+        继续**，不会被归档阻塞。原图与成品落盘后不可变（原图按文档 ID 保存、
+        成品按版本保存，发布/撤回均不改写文件），故快照记录与随后在快照事务
+        内读取的文件字节必然同属一个时点。
+
+        文件以**相对路径**组织（``originals/``、``publications/`` 加顶层
+        JSON），不包含任何服务端绝对路径或上传文件名；另附 ``manifest.json``
+        清单，逐文件列出 SHA-256、文档/版本标识与文件数。
+
+        **全有或全无**：任一被引用文件缺失、读盘失败或实际摘要与快照记录不符
+        都整单拒绝（不返回 ZIP、不提供部分归档）；ZIP 必须在临时文件上**完整
+        生成并正常关闭**后才作为下载响应，任何失败都清理临时文件。
+        """
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-archive-", suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            # 记录读取、文件读盘/摘要复算、ZIP 生成全部在同一只读快照事务内：
+            # 与并发写入互不干扰（读快照固定），且不阻塞任何写入。
+            with snapshot_tx(settings.db_path) as conn:
+                docs = conn.execute(
+                    "SELECT * FROM documents ORDER BY id"
+                ).fetchall()
+                pubs = conn.execute(
+                    "SELECT * FROM publications"
+                    " ORDER BY doc_id, version"
+                ).fetchall()
+                batches = conn.execute(
+                    "SELECT * FROM publication_batches ORDER BY id"
+                ).fetchall()
+                withdrawals = conn.execute(
+                    "SELECT * FROM publication_withdrawals"
+                    " ORDER BY doc_id, version"
+                ).fetchall()
+
+                # 标注矩形按 (doc_id, revision, idx) 追加存储、永不改写：
+                # 归档全部修订（含 revision=0 与已清空的修订），忠实复制快照。
+                rect_rows = conn.execute(
+                    "SELECT doc_id, revision, idx, x, y, w, h, reason"
+                    " FROM annotation_rects ORDER BY doc_id, revision, idx"
+                ).fetchall()
+                rects_by_doc_rev: dict[tuple[str, int], list[dict]] = {}
+                for r in rect_rows:
+                    rects_by_doc_rev.setdefault(
+                        (r["doc_id"], r["revision"]), []
+                    ).append(_rect_out(r))
+
+                # 每份文档的归档文档条目与归档内原图相对路径（不取上传文件名）。
+                doc_entries: list[dict] = []
+                doc_by_id: dict[str, Any] = {}
+                for d in docs:
+                    doc_by_id[d["id"]] = d
+                    doc_entries.append(
+                        {
+                            "doc_id": d["id"],
+                            "filename": d["filename"],
+                            "media_type": d["media_type"],
+                            "width": d["width"],
+                            "height": d["height"],
+                            "original_sha256": d["original_sha256"],
+                            "original_file": _archive_original_relpath(d),
+                            "annotation_revision": d["annotation_revision"],
+                            "created_at": d["created_at"],
+                        }
+                    )
+
+                # 每个被引用文档的各修订标注（矩形数即该修订文件数口径之一）。
+                revision_counts: dict[str, int] = {}
+                annotation_docs: list[dict] = []
+                for d in docs:
+                    revisions: list[dict] = []
+                    for rev in range(d["annotation_revision"] + 1):
+                        rects = rects_by_doc_rev.get((d["id"], rev), [])
+                        revisions.append(
+                            {"revision": rev, "rect_count": len(rects),
+                             "rects": rects}
+                        )
+                    revision_counts[d["id"]] = len(revisions)
+                    annotation_docs.append(
+                        {"doc_id": d["id"],
+                         "current_revision": d["annotation_revision"],
+                         "revision_count": len(revisions),
+                         "revisions": revisions}
+                    )
+
+                withdrawal_by_pub = {
+                    (w["doc_id"], w["version"]): w for w in withdrawals
+                }
+                batch_pub_rows = conn.execute(
+                    "SELECT batch_id, position, doc_id, version"
+                    " FROM batch_publications ORDER BY batch_id, position"
+                ).fetchall()
+                members_by_batch: dict[str, list[dict]] = {}
+                for bp in batch_pub_rows:
+                    members_by_batch.setdefault(bp["batch_id"], []).append(
+                        {"position": bp["position"], "doc_id": bp["doc_id"],
+                         "version": bp["version"]}
+                    )
+
+                publication_entries: list[dict] = []
+                for p in pubs:
+                    w = withdrawal_by_pub.get((p["doc_id"], p["version"]))
+                    publication_entries.append(
+                        {
+                            "doc_id": p["doc_id"],
+                            "version": p["version"],
+                            "annotation_revision": p["annotation_revision"],
+                            "original_sha256": p["original_sha256"],
+                            "output_sha256": p["output_sha256"],
+                            "output_file":
+                                f"publications/{p['doc_id']}/v{p['version']}.png",
+                            "created_at": p["created_at"],
+                            "batch_id": p["batch_id"],
+                            "publish_at": p["publish_at"],
+                            "withdrawn": w is not None,
+                            "withdrawn_at": w["withdrawn_at"] if w else None,
+                            "withdrawal_reason": w["reason"] if w else None,
+                        }
+                    )
+
+                batch_entries = [
+                    {
+                        "batch_id": b["id"],
+                        "created_at": b["created_at"],
+                        "publish_at": b["publish_at"],
+                        "documents": members_by_batch.get(b["id"], []),
+                    }
+                    for b in batches
+                ]
+                withdrawal_entries = [
+                    {
+                        "doc_id": w["doc_id"],
+                        "version": w["version"],
+                        "reason": w["reason"],
+                        "withdrawn_at": w["withdrawn_at"],
+                    }
+                    for w in withdrawals
+                ]
+
+                # 测试钩子：快照记录已全部读出、引用文件尚未读盘。
+                # 并发测试在此提交标注/发布等写入，验证归档不看到新数据、
+                # 也不被写入阻塞。
+                if ARCHIVE_SNAPSHOT_HOOK is not None:
+                    ARCHIVE_SNAPSHOT_HOOK()
+
+                # 引用文件读盘 + 摘要复算：先把全部字节读入并校验，再写 ZIP，
+                # 任一文件缺失/读盘失败/摘要不符即整单拒绝，ZIP 中无残留失败项。
+                # 清单条目按归档内相对路径排序，保证归档可逐字节复现。
+                file_entries: list[dict] = []
+                zip_members: list[tuple[str, bytes]] = []
+
+                for d in docs:
+                    relpath = _archive_original_relpath(d)
+                    data, actual_sha = _read_and_verify_archive_file(
+                        d["original_path"],
+                        d["original_sha256"],
+                        kind="stored original image",
+                        missing_code="archive_original_missing",
+                        read_code="archive_original_read_failed",
+                        corrupt_code="archive_original_corrupt",
+                        doc_id=d["id"],
+                    )
+                    file_entries.append(
+                        {
+                            "path": relpath,
+                            "kind": "original",
+                            "doc_id": d["id"],
+                            "sha256": actual_sha,
+                            "file_count": 1,
+                        }
+                    )
+                    zip_members.append((relpath, data))
+
+                for p in pubs:
+                    relpath = f"publications/{p['doc_id']}/v{p['version']}.png"
+                    data, actual_sha = _read_and_verify_archive_file(
+                        p["output_path"],
+                        p["output_sha256"],
+                        kind="published artifact",
+                        missing_code="archive_artifact_missing",
+                        read_code="archive_artifact_read_failed",
+                        corrupt_code="archive_artifact_corrupt",
+                        doc_id=p["doc_id"],
+                        version=p["version"],
+                    )
+                    file_entries.append(
+                        {
+                            "path": relpath,
+                            "kind": "publication",
+                            "doc_id": p["doc_id"],
+                            "version": p["version"],
+                            "sha256": actual_sha,
+                            "file_count": 1,
+                        }
+                    )
+                    zip_members.append((relpath, data))
+
+                # 记录 JSON（与上面的快照读取同一事务，内容同属一个时点）。
+                json_docs = {
+                    "count": len(doc_entries),
+                    "documents": doc_entries,
+                }
+                json_annotations = {
+                    "document_count": len(annotation_docs),
+                    "revision_count": sum(revision_counts.values()),
+                    "documents": annotation_docs,
+                }
+                json_publications = {
+                    "count": len(publication_entries),
+                    "publications": publication_entries,
+                }
+                json_batches = {
+                    "count": len(batch_entries),
+                    "batches": batch_entries,
+                }
+                json_withdrawals = {
+                    "count": len(withdrawal_entries),
+                    "withdrawals": withdrawal_entries,
+                }
+                record_files = [
+                    ("documents.json", json_docs),
+                    ("annotations.json", json_annotations),
+                    ("publications.json", json_publications),
+                    ("publication-batches.json", json_batches),
+                    ("withdrawals.json", json_withdrawals),
+                ]
+                for name, payload in record_files:
+                    raw = json.dumps(payload, ensure_ascii=False, indent=2,
+                                    sort_keys=False).encode("utf-8")
+                    file_entries.append(
+                        {
+                            "path": name,
+                            "kind": "records",
+                            "sha256": _sha256_bytes(raw),
+                            "file_count": 1,
+                        }
+                    )
+                    zip_members.append((name, raw))
+
+                file_entries.sort(key=lambda e: e["path"])
+                zip_members.sort(key=lambda m: m[0])
+
+                generated_at = _utcnow()
+                manifest = {
+                    "generated_at": generated_at,
+                    "snapshot": {
+                        # 归档只对应这一个一致时点；时间仅作人工标识，
+                        # 真正的一致性由读快照保证。
+                        "note": "all records and referenced files were read"
+                                " from one read-only database snapshot",
+                    },
+                    "record_counts": {
+                        "documents": len(doc_entries),
+                        "annotation_revisions":
+                            json_annotations["revision_count"],
+                        "publications": len(publication_entries),
+                        "publication_batches": len(batch_entries),
+                        "withdrawals": len(withdrawal_entries),
+                    },
+                    # 归档内除清单外的文件总数（原图 + 成品 + 记录 JSON）
+                    "file_count": len(file_entries),
+                    "files": file_entries,
+                }
+                manifest_raw = json.dumps(
+                    manifest, ensure_ascii=False, indent=2
+                ).encode("utf-8")
+
+                # 完整写出 ZIP 并正常关闭（写完中央目录）后才离开本块；
+                # 写盘失败转换为统一业务错误（随外层 except 清理临时文件、
+                # 整单拒绝），绝不交付一个未完整生成的 ZIP。
+                try:
+                    with zipfile.ZipFile(tmp_path, "w",
+                                         zipfile.ZIP_DEFLATED) as zf:
+                        for relpath, data in zip_members:
+                            zf.writestr(relpath, data)
+                        # 清单最后写入；它列出此前所有成员的 SHA-256 与文件数。
+                        zf.writestr("manifest.json", manifest_raw)
+                except OSError as exc:
+                    _error(
+                        500,
+                        "archive_write_failed",
+                        f"failed to fully write the archive ZIP: {exc}",
+                    )
+            # 事务以 rollback 结束（纯只读），ZIP 已在临时文件上完整生成。
+        except Exception:
+            _cleanup_tempfile(tmp_path)
+            raise
+        background_tasks.add_task(_cleanup_tempfile, tmp_path)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=f"service-data-archive-{stamp}.zip",
         )
 
     return app
