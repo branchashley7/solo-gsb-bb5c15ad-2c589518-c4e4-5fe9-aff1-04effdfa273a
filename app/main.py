@@ -49,6 +49,11 @@ PACKAGE_ELIGIBILITY_HOOK: Any = None
 # 提交标注修改，验证比较全程使用同一读取快照（不看到提交后的新标注）。
 COVERAGE_DIFF_SNAPSHOT_HOOK: Any = None
 
+# 服务数据归档"只读快照已建立、四类记录已读出 -> 校验并打包引用文件"之间
+# 的钩子。生产中为空操作；并发测试借此在快照建立后提交新写入，验证归档
+# 内容停留在快照时点，且归档生成（只读快照）不阻塞并发写入。
+ARCHIVE_SNAPSHOT_HOOK: Any = None
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1380,6 +1385,268 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tmp_path,
             media_type="application/zip",
             filename="publication-package.zip",
+        )
+
+    # ---------------- 服务数据归档（同一快照：记录导出 + 引用文件） ----------------
+
+    @app.post("/service-archives")
+    def create_service_archive(
+        background_tasks: BackgroundTasks,
+    ) -> FileResponse:
+        """生成服务数据归档 ZIP：同一数据库快照中的文档、标注、发布与撤回
+        记录，以及该快照引用的全部原图与发布成品。
+
+        全部记录在**同一个只读快照事务**（``snapshot_tx``，WAL 读快照）中
+        读出：归档只包含该一致时点已提交的数据；只读事务不获取写锁，生成
+        期间并发写入可继续，但快照建立之后提交的写入不进入本次归档——
+        每份归档始终只对应一个一致时点。快照引用的原图与成品落盘后不再
+        改动，逐一复算 SHA-256 与快照记录比对：任一文件缺失或摘要不符
+        即拒绝整个请求，不交付部分归档。ZIP 在临时文件中完整生成后才
+        作为下载响应返回；生成过程中的任何失败都清理临时文件。
+        """
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-archive-", suffix=".zip")
+        os.close(tmp_fd)
+        try:
+            with snapshot_tx(settings.db_path) as conn:
+                # 同一 WAL 读快照：以下全部 SELECT 落在同一个一致时点上，
+                # 快照建立后并发提交的写入对本事务不可见。
+                docs = conn.execute(
+                    "SELECT * FROM documents ORDER BY created_at, id"
+                ).fetchall()
+                rect_rows = conn.execute(
+                    "SELECT * FROM annotation_rects"
+                    " ORDER BY doc_id, revision, idx"
+                ).fetchall()
+                pubs = conn.execute(
+                    "SELECT * FROM publications ORDER BY doc_id, version"
+                ).fetchall()
+                withdrawal_rows = conn.execute(
+                    "SELECT * FROM publication_withdrawals"
+                    " ORDER BY doc_id, version"
+                ).fetchall()
+
+                # 测试钩子：快照已建立、记录已读出，引用文件尚未校验。
+                if ARCHIVE_SNAPSHOT_HOOK is not None:
+                    ARCHIVE_SNAPSHOT_HOOK()
+
+                def _load_referenced(
+                    kind: str, path: str, expected_sha: str, **ids: Any
+                ) -> bytes:
+                    """读入快照引用的文件并复算摘要；缺失/失败/不符即整体拒绝。"""
+                    if not os.path.exists(path):
+                        _error(
+                            500,
+                            f"{kind}_missing",
+                            f"archived {kind} file referenced by the snapshot"
+                            " is missing on disk",
+                            **ids,
+                        )
+                    try:
+                        with open(path, "rb") as f:
+                            data = f.read()
+                    except OSError as exc:
+                        _error(
+                            500,
+                            f"{kind}_read_failed",
+                            f"failed to read archived {kind} file referenced"
+                            f" by the snapshot: {exc}",
+                            **ids,
+                        )
+                    if _sha256_bytes(data) != expected_sha:
+                        _error(
+                            500,
+                            f"{kind}_corrupt",
+                            f"archived {kind} file referenced by the snapshot"
+                            " failed integrity check",
+                            **ids,
+                        )
+                    return data
+
+                # 第一阶段：校验快照引用的全部文件（原图 + 发布成品）并读入。
+                # 任一缺失、读盘失败或摘要不符都在此整体拒绝——ZIP 此时尚未
+                # 写入任何条目，绝不交付部分归档。包内路径只由服务端文档 ID、
+                # 版本号与存储后缀生成，绝不取自上传文件名。
+                originals: list[tuple[str, str, bytes, str]] = []
+                for doc in docs:
+                    arcname = "originals/" + doc["id"] + os.path.splitext(
+                        doc["original_path"]
+                    )[1]
+                    data = _load_referenced(
+                        "original",
+                        doc["original_path"],
+                        doc["original_sha256"],
+                        doc_id=doc["id"],
+                    )
+                    originals.append((doc["id"], arcname, data, doc["original_sha256"]))
+                artifacts: list[tuple[str, int, str, bytes, str]] = []
+                for pub in pubs:
+                    arcname = (
+                        f"publications/{pub['doc_id']}/v{pub['version']}.png"
+                    )
+                    data = _load_referenced(
+                        "artifact",
+                        pub["output_path"],
+                        pub["output_sha256"],
+                        doc_id=pub["doc_id"],
+                        version=pub["version"],
+                    )
+                    artifacts.append(
+                        (pub["doc_id"], pub["version"], arcname, data,
+                         pub["output_sha256"])
+                    )
+
+                # 第二阶段：由快照记录生成 db/ 导出（JSON 字节）。
+                original_arc = {doc_id: arc for doc_id, arc, _, _ in originals}
+                artifact_arc = {
+                    (doc_id, version): arc
+                    for doc_id, version, arc, _, _ in artifacts
+                }
+                db_exports: list[tuple[str, bytes]] = [
+                    (
+                        "db/documents.json",
+                        {
+                            "count": len(docs),
+                            "documents": [
+                                {
+                                    "doc_id": doc["id"],
+                                    "filename": doc["filename"],
+                                    "media_type": doc["media_type"],
+                                    "width": doc["width"],
+                                    "height": doc["height"],
+                                    "original_sha256": doc["original_sha256"],
+                                    "annotation_revision":
+                                        doc["annotation_revision"],
+                                    "created_at": doc["created_at"],
+                                    "file": original_arc[doc["id"]],
+                                }
+                                for doc in docs
+                            ],
+                        },
+                    ),
+                    (
+                        "db/annotations.json",
+                        {
+                            "count": len(rect_rows),
+                            "annotations": [
+                                {
+                                    "doc_id": r["doc_id"],
+                                    "revision": r["revision"],
+                                    "idx": r["idx"],
+                                    "x": r["x"],
+                                    "y": r["y"],
+                                    "w": r["w"],
+                                    "h": r["h"],
+                                    "reason": r["reason"],
+                                }
+                                for r in rect_rows
+                            ],
+                        },
+                    ),
+                    (
+                        "db/publications.json",
+                        {
+                            "count": len(pubs),
+                            "publications": [
+                                {
+                                    "doc_id": pub["doc_id"],
+                                    "version": pub["version"],
+                                    "annotation_revision":
+                                        pub["annotation_revision"],
+                                    "original_sha256": pub["original_sha256"],
+                                    "output_sha256": pub["output_sha256"],
+                                    "created_at": pub["created_at"],
+                                    "batch_id": pub["batch_id"],
+                                    "publish_at": pub["publish_at"],
+                                    "file": artifact_arc[
+                                        (pub["doc_id"], pub["version"])
+                                    ],
+                                }
+                                for pub in pubs
+                            ],
+                        },
+                    ),
+                    (
+                        "db/withdrawals.json",
+                        {
+                            "count": len(withdrawal_rows),
+                            "withdrawals": [
+                                {
+                                    "doc_id": w["doc_id"],
+                                    "version": w["version"],
+                                    "reason": w["reason"],
+                                    "withdrawn_at": w["withdrawn_at"],
+                                }
+                                for w in withdrawal_rows
+                            ],
+                        },
+                    ),
+                ]
+                db_payloads = [
+                    (
+                        arcname,
+                        json.dumps(payload, ensure_ascii=False, indent=2)
+                        .encode("utf-8"),
+                    )
+                    for arcname, payload in db_exports
+                ]
+
+                # 第三阶段：一次性生成完整 ZIP（相对路径），清单最后写入。
+                # 清单逐项列出包内文件（除清单自身）的 SHA-256 与文档/版本
+                # 标识，并给出记录数与文件数。
+                manifest_files: list[dict] = []
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for arcname, payload in db_payloads:
+                        zf.writestr(arcname, payload)
+                        manifest_files.append(
+                            {
+                                "path": arcname,
+                                "sha256": _sha256_bytes(payload),
+                            }
+                        )
+                    for doc_id, arcname, data, sha in originals:
+                        zf.writestr(arcname, data)
+                        manifest_files.append(
+                            {"path": arcname, "sha256": sha, "doc_id": doc_id}
+                        )
+                    for doc_id, version, arcname, data, sha in artifacts:
+                        zf.writestr(arcname, data)
+                        manifest_files.append(
+                            {
+                                "path": arcname,
+                                "sha256": sha,
+                                "doc_id": doc_id,
+                                "version": version,
+                            }
+                        )
+                    manifest = {
+                        "created_at": _utcnow(),
+                        "counts": {
+                            "documents": len(docs),
+                            "annotation_rects": len(rect_rows),
+                            "publications": len(pubs),
+                            "withdrawals": len(withdrawal_rows),
+                            "record_files": len(db_payloads),
+                            "original_files": len(originals),
+                            "publication_files": len(artifacts),
+                            "files": len(db_payloads)
+                            + len(originals)
+                            + len(artifacts),
+                        },
+                        "files": manifest_files,  # 顺序与包内条目一致
+                    }
+                    zf.writestr(
+                        "manifest.json",
+                        json.dumps(manifest, ensure_ascii=False, indent=2),
+                    )
+            # 只读快照事务结束：归档内容全程对应同一个一致时点。
+        except Exception:
+            _cleanup_tempfile(tmp_path)
+            raise
+        background_tasks.add_task(_cleanup_tempfile, tmp_path)
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename="service-archive.zip",
         )
 
     return app

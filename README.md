@@ -18,6 +18,13 @@
 版本只要出现一项即**整包拒绝**且不泄露该项成品/遮盖详情；重复项、数量越界同样明确
 报错。打包的资格确认与撤回**串行**：撤回先生效则拒绝，打包先确认则本次交付完成。
 
+运维人员可请求生成**服务数据归档**（`POST /service-archives`）：同一数据库快照中的
+文档、标注、发布与撤回记录导出（`db/*.json`），加上该快照引用的全部原图与发布成品，
+以**相对路径**组织成 ZIP，附 `manifest.json` 清单逐项列出 SHA-256、文档/版本标识与
+文件数。归档只包含该一致时点已提交的数据；生成期间并发写入可继续（只读快照不持
+写锁），但不会进入本次归档——每份归档只对应一个一致时点。任一快照引用文件缺失或
+摘要不符即**拒绝整个请求**，不交付部分归档；ZIP 完整生成后才作为下载响应。
+
 ## 一键启动（Docker Compose）
 
 ```bash
@@ -73,6 +80,7 @@ python -m pytest tests/ -q
 | GET  | `/publications/{doc_id}/{version}/image` | 公开读取：发布版 PNG（未到公开时间 404） |
 | POST | `/documents/{doc_id}/coverage-diff` | **重发前遮盖范围比较**（只读）：当前标注修订号 + 基准发布版本号 → 新增/失去遮盖像素数、占旋正后图像比例、失去遮盖水平段 |
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
+| POST | `/service-archives` | **服务数据归档**（运维）：返回 ZIP——同一数据库快照的文档/标注/发布/撤回记录导出（`db/*.json`）+ 快照引用的全部原图与成品（相对路径），附 SHA-256 清单；任一引用文件缺失/摘要不符即整体拒绝 |
 
 ## 调用示例（curl）
 
@@ -565,6 +573,70 @@ manifest.json
 
 端到端示例（含成功交付校验与各类整包拒绝）：`bash examples/demo_package.sh`。
 
+## 服务数据归档（同一快照：记录导出 + 引用文件）
+
+运维人员需要把某一一致时点的全部服务数据取走（备份、审计、迁移）时，调用
+`POST /service-archives`（无请求体）：
+
+```bash
+BASE=http://localhost:8000
+curl -sS -o service-archive.zip -X POST "$BASE/service-archives"
+# -> 200，Content-Type: application/zip，Content-Disposition: service-archive.zip
+```
+
+成功 `200` 返回 ZIP（默认下载名 `service-archive.zip`），以**相对路径**组织：
+
+```
+db/documents.json       # 文档记录（含归档内原图相对路径 file）
+db/annotations.json     # 全部标注矩形（所有历史修订，追加存储永不改写）
+db/publications.json    # 发布记录（含归档内成品相对路径 file、批次与公开时间）
+db/withdrawals.json     # 撤回记录（原因与时间）
+originals/<doc_id>.png|.jpg        # 快照引用的原图（后缀同存储格式）
+publications/<doc_id>/v<version>.png  # 快照引用的发布成品
+manifest.json           # 清单：逐项 SHA-256 + 文档/版本标识 + 记录数与文件数
+```
+
+- **同一一致时点**：四类记录在同一个**只读快照事务**（WAL 读快照）中读出，
+  归档只包含该时点**已提交**的数据；只读事务不获取写锁，**生成期间并发写入
+  可继续**，但快照建立之后提交的写入不进入本次归档——每份归档只对应一个
+  一致时点。原图与成品落盘后不再改动，快照引用的文件内容因此与记录必然对应。
+- **运维视角全量入档**：归档不做公开面门控——已撤回、未到公开时间的版本
+  及其记录同样包含（撤回记录本身也在 `db/withdrawals.json` 中）。
+- **包内路径**只由服务端文档 ID、版本号与存储后缀生成，**绝不取自上传文件名**。
+- **`manifest.json`** 逐项列出包内文件（清单自身除外）的 `path` 与 `sha256`：
+  原图条目附 `doc_id`，成品条目附 `doc_id`+`version`；顶层 `counts` 给出
+  记录数（`documents`/`annotation_rects`/`publications`/`withdrawals`）与
+  文件数（`record_files`/`original_files`/`publication_files`/`files`）：
+
+```json
+{
+  "created_at": "2026-10-06T07:55:11+00:00",
+  "counts": {"documents": 2, "annotation_rects": 4, "publications": 3,
+             "withdrawals": 1, "record_files": 4, "original_files": 2,
+             "publication_files": 3, "files": 9},
+  "files": [
+    {"path": "db/documents.json", "sha256": "fe7f…"},
+    {"path": "originals/<doc_id>.png", "sha256": "637b…", "doc_id": "…"},
+    {"path": "publications/<doc_id>/v1.png", "sha256": "251a…",
+     "doc_id": "…", "version": 1}
+  ]
+}
+```
+
+- **拒绝整个请求（绝不交付部分归档）**：生成前逐一复算快照引用文件的
+  SHA-256 并与快照记录比对，任一缺失或不符即整体拒绝，响应为统一错误体
+  （非 ZIP）：原图缺失 `500 original_missing`、读盘失败
+  `500 original_read_failed`、摘要不符 `500 original_corrupt`（均附
+  `doc_id`）；成品缺失 `500 artifact_missing`、读盘失败
+  `500 artifact_read_failed`、摘要不符 `500 artifact_corrupt`（均附
+  `doc_id`/`version`）。
+- **完整生成后才交付**：ZIP 先写入服务端临时文件，全部条目（含清单）生成
+  完毕才作为下载响应返回；生成过程中的任何失败都删除临时文件，响应发送
+  完成后临时文件自动清理。
+
+端到端示例（含归档结构展示、清单校验与引用文件缺失的整体拒绝）：
+`bash examples/demo_archive.sh`。
+
 
 ## 错误响应
 
@@ -593,9 +665,12 @@ manifest.json
 | 409 | `idempotency_key_conflict` | 幂等键已用于不同内容的批次请求（原批次不受影响） |
 | 500 | `original_unavailable` | 存储的原图无法读取/解码（批次场景附 `position`/`doc_id`） |
 | 500 | `artifact_write_failed` | 发布成品写入磁盘失败（附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_missing` | 发布成品在磁盘上缺失（单份图片读取；离线交付包附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_read_failed` | 离线交付包读成品文件失败（附 `position`/`doc_id`/`version`） |
-| 500 | `artifact_corrupt` | 离线交付包中成品实际 SHA-256 与发布记录不符（附 `position`/`doc_id`/`version`） |
+| 500 | `artifact_missing` | 发布成品在磁盘上缺失（单份图片读取；离线交付包附 `position`/`doc_id`/`version`；服务数据归档附 `doc_id`/`version`） |
+| 500 | `artifact_read_failed` | 读成品文件失败（离线交付包附 `position`/`doc_id`/`version`；服务数据归档附 `doc_id`/`version`） |
+| 500 | `artifact_corrupt` | 成品实际 SHA-256 与发布记录不符（离线交付包附 `position`/`doc_id`/`version`；服务数据归档附 `doc_id`/`version`） |
+| 500 | `original_missing` | 服务数据归档：快照引用的原图在磁盘上缺失（附 `doc_id`），整个请求拒绝 |
+| 500 | `original_read_failed` | 服务数据归档：读原图文件失败（附 `doc_id`），整个请求拒绝 |
+| 500 | `original_corrupt` | 服务数据归档：原图实际 SHA-256 与文档记录不符（附 `doc_id`），整个请求拒绝 |
 | 400 | `invalid_package_size` | 离线交付包条目数不在 2～20（附 `count`） |
 | 400 | `duplicate_item_in_package` | 交付包内 `(doc_id, version)` 对重复（附 `position`/`doc_id`/`version`） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
@@ -672,6 +747,17 @@ manifest.json
   才生效，本次交付完成；包内 PNG 文件名只由请求位置、服务端文档 ID 与版本号
   生成，不取自上传文件名，`manifest.json` 按请求顺序记录文档 ID、版本号、
   成品 SHA-256、遮盖数与包内文件名。
+- **服务数据归档**：`POST /service-archives` 在**一个只读快照事务**
+  （延迟 `BEGIN`，首条 SELECT 建立 WAL 读快照）中读出文档、标注、发布与
+  撤回四类记录——归档只包含该一致时点已提交的数据；只读事务不持写锁，
+  生成期间并发写入可继续，但快照建立后提交的写入对本次归档不可见，
+  每份归档只对应一个一致时点。快照引用的原图与成品落盘后不再改动，
+  逐一复算 SHA-256 与快照记录比对，任一缺失/读盘失败/摘要不符即整体
+  拒绝（此时 ZIP 尚未写入任何条目，绝不交付部分归档）；全部文件校验
+  通过后才一次性生成 ZIP（`db/*.json` 记录导出 + `originals/` 原图 +
+  `publications/` 成品 + `manifest.json` 清单，均为相对路径，文件名只由
+  服务端 ID/版本号/存储后缀生成），ZIP 完整生成后才作为下载响应返回，
+  失败或交付完成后临时文件均清理。
 
 ## 目录结构
 
@@ -705,6 +791,10 @@ tests/test_coverage_diff.py  # 31 个用例：新增/失去像素数与占比、
                              #   基准冻结不受后续修改影响、未知/未到点/撤回不
                              #   泄露详情、修订过期、纯只读、并发标注下同一快照、
                              #   纯几何区间并集/相减
+tests/test_archive.py        # 9 个用例：归档结构/记录导出/清单摘要与标识/
+                             #   文件数、空库、已撤回与未到点版本入档、同一快照
+                             #   且并发写入可继续、原图/成品缺失或摘要不符整体
+                             #   拒绝、临时文件交付后与失败后均清理
 examples/demo.sh             # 单份端到端 curl 示例
 examples/demo_batch.sh       # 批次发布端到端 curl 示例
 examples/demo_idempotency.sh # 批次幂等键端到端 curl 示例
@@ -713,10 +803,41 @@ examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
+examples/demo_archive.sh     # 服务数据归档端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（重发前遮盖范围比较）
+## 本轮变动（服务数据归档）
+
+- 新增 `POST /service-archives`（无请求体，运维用途）：成功 `200` 返回
+  `application/zip`（下载名 `service-archive.zip`），内容为**同一数据库
+  快照**中的文档、标注、发布与撤回记录导出（`db/documents.json`、
+  `db/annotations.json`、`db/publications.json`、`db/withdrawals.json`，
+  各含 `count` 与记录列表，文档/发布记录附归档内相对路径 `file`），
+  加上该快照引用的全部原图（`originals/<doc_id>.png|.jpg`）与发布成品
+  （`publications/<doc_id>/v<version>.png`），全部**相对路径**组织，
+  文件名只由服务端 ID/版本号/存储后缀生成。
+- **同一一致时点**：四类记录在**一个只读快照事务**（`snapshot_tx`，WAL
+  读快照）中读出，归档只包含该时点已提交的数据；只读事务不持写锁，
+  **生成期间并发写入可继续**，快照建立后提交的写入不进入本次归档。
+  运维视角全量入档：已撤回、未到公开时间的版本及其记录同样包含。
+- **`manifest.json` 清单**最后写入：逐项列出包内文件（清单自身除外）的
+  `path` 与 `sha256`，原图条目附 `doc_id`、成品条目附 `doc_id`+`version`；
+  顶层 `counts` 给出记录数（`documents`/`annotation_rects`/`publications`/
+  `withdrawals`）与文件数（`record_files`/`original_files`/
+  `publication_files`/`files`）。
+- **整体拒绝，不交付部分归档**：先逐一复算快照引用文件的 SHA-256 并与
+  快照记录比对，任一缺失/读盘失败/摘要不符即整体拒绝（新增错误码
+  `original_missing`/`original_read_failed`/`original_corrupt`，成品侧
+  复用 `artifact_missing`/`artifact_read_failed`/`artifact_corrupt`）；
+  全部通过后 ZIP 在临时文件中**完整生成**才作为下载响应返回，失败与
+  交付完成后临时文件均清理。
+- 复用既有只读快照助手 `app/db.py::snapshot_tx`；**不新增任何数据表或列**，
+  上传、标注、发布（含定时公开）、批次与幂等键、撤回、公开读取、遮盖范围
+  比较、离线交付包的路由、请求/响应字段及启动方式（Docker Compose /
+  uvicorn）全部保持兼容。
+
+## 历史变动（重发前遮盖范围比较）
 
 - 新增 `POST /documents/{doc_id}/coverage-diff`：请求体
   `{"revision","baseline_version"}` 携带**当前标注修订号**与**基准发布
